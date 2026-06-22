@@ -15,6 +15,7 @@ import QRCodeStyling, {
   CornerDotType
 } from "qr-code-styling";
 import jsQR from "jsqr";
+import { BrowserMultiFormatReader } from "@zxing/library";
 import { 
   Download, 
   Link as LinkIcon, 
@@ -171,6 +172,115 @@ async function decodeQrFromDataUrl(dataUrl: string): Promise<string | null> {
   return null;
 }
 
+/* ------------------------------------------------------------------ */
+/*  MAXIMUM ROBUSTNESS FALLBACK — ZXing                                */
+/*  ------------------------------------------------------------------ */
+/*  jsQR is fast and handles the vast majority of real-world cases    */
+/*  once preprocessed (see above). But it still struggles with:       */
+/*    - Strong perspective distortion (QR photographed at an angle)   */
+/*    - Partial occlusion / damaged corners                           */
+/*    - Very low resolution or extreme blur                           */
+/*    - Some non-standard QR variants (Micro QR, certain masks)       */
+/*                                                                      */
+/*  ZXing (the engine behind most production barcode scanners,        */
+/*  including Android's) is significantly more tolerant of these      */
+/*  cases, at the cost of being slower. We treat it as a *fallback*:  */
+/*  only run it if every jsQR attempt above has already failed, so    */
+/*  the common case stays fast and the worst-case still has a shot.   */
+/* ------------------------------------------------------------------ */
+
+let zxingReader: BrowserMultiFormatReader | null = null;
+function getZxingReader(): BrowserMultiFormatReader {
+  if (!zxingReader) {
+    zxingReader = new BrowserMultiFormatReader();
+  }
+  return zxingReader;
+}
+
+/** Converts a canvas to an HTMLImageElement, since ZXing's browser API
+ *  (in @zxing/library) decodes from <img>/<video> elements, not canvases
+ *  directly — there is no `decodeFromCanvas` method on this package. */
+function canvasToImage(canvas: HTMLCanvasElement): Promise<HTMLImageElement> {
+  return loadImage(canvas.toDataURL("image/png"));
+}
+
+/**
+ * Tries to decode using ZXing against the original image (it does its
+ * own internal scaling/binarization) plus a couple of canvas variants
+ * for extra coverage on rotated or low-contrast codes.
+ */
+async function decodeWithZxing(img: HTMLImageElement): Promise<string | null> {
+  const reader = getZxingReader();
+
+  // Candidate sources: a few rescaled/rotated canvases. ZXing's own
+  // binarizer is quite good, so we lean mostly on its internal
+  // processing rather than re-doing heavy prep here.
+  const candidateCanvases: HTMLCanvasElement[] = [
+    drawScaled(img, 1000),
+    drawScaled(img, 600),
+  ];
+
+  // A few rotations to recover codes photographed at an angle.
+  for (const angle of [90, 180, 270]) {
+    const base = drawScaled(img, 800);
+    const rotated = document.createElement("canvas");
+    const isQuarterTurn = angle === 90 || angle === 270;
+    rotated.width = isQuarterTurn ? base.height : base.width;
+    rotated.height = isQuarterTurn ? base.width : base.height;
+    const rctx = rotated.getContext("2d")!;
+    rctx.translate(rotated.width / 2, rotated.height / 2);
+    rctx.rotate((angle * Math.PI) / 180);
+    rctx.drawImage(base, -base.width / 2, -base.height / 2);
+    candidateCanvases.push(rotated);
+  }
+
+  for (const canvas of candidateCanvases) {
+    try {
+      const candidateImg = await canvasToImage(canvas);
+      const result = await reader.decodeFromImageElement(candidateImg);
+      if (result?.getText()) {
+        return result.getText();
+      }
+    } catch {
+      // ZXing throws (NotFoundException) when it can't find a code in
+      // this candidate — that's expected and we just move to the next one.
+      continue;
+    }
+  }
+
+  return null;
+}
+
+
+/**
+ * Full decode pipeline with an optional "maximum robustness" mode.
+ *   - Always tries jsQR first (fast, covers most real cases).
+ *   - If that fails and `maxRobustness` is enabled, falls back to
+ *     ZXing with rotation variants (slower, but recovers much harder
+ *     cases: perspective, heavy rotation, low resolution).
+ * Returns the decoded text plus which engine succeeded, or null.
+ */
+async function decodeQr(
+  dataUrl: string,
+  maxRobustness: boolean
+): Promise<{ text: string; engine: "jsQR" | "ZXing" } | null> {
+  const img = await loadImage(dataUrl);
+
+  const fastResult = await decodeQrFromDataUrl(dataUrl);
+  if (fastResult) {
+    return { text: fastResult, engine: "jsQR" };
+  }
+
+  if (maxRobustness) {
+    const robustResult = await decodeWithZxing(img);
+    if (robustResult) {
+      return { text: robustResult, engine: "ZXing" };
+    }
+  }
+
+  return null;
+}
+
 export default function App() {
   const [url, setUrl] = useState("https://google.com");
   const [dotsColor, setDotsColor] = useState("#000000");
@@ -183,6 +293,8 @@ export default function App() {
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [maxRobustness, setMaxRobustness] = useState(false);
+  const [scanEngine, setScanEngine] = useState<"jsQR" | "ZXing" | null>(null);
 
   const [downloadFormat, setDownloadFormat] = useState<Extension>("png");
   const [resolution, setResolution] = useState(1000);
@@ -266,6 +378,7 @@ export default function App() {
     const file = e.target.files?.[0];
     setScanResult(null);
     setScanError(null);
+    setScanEngine(null);
     if (!file) {
       setQrPreview(null);
       return;
@@ -286,17 +399,24 @@ export default function App() {
     setIsScanning(true);
     setScanResult(null);
     setScanError(null);
+    setScanEngine(null);
 
     try {
-      const result = await decodeQrFromDataUrl(qrPreview);
+      const result = await decodeQr(qrPreview, maxRobustness);
+
       setIsScanning(false);
 
       if (!result) {
-        setScanError("No se pudo leer el código QR. Intenta con una foto más nítida, con mejor luz, o más de cerca.");
+        setScanError(
+          maxRobustness
+            ? "No se pudo leer el código QR ni con el modo de máxima robustez. Intenta con una foto más nítida, mejor luz, o más de cerca."
+            : "No se pudo leer el código QR. Intenta con una foto más nítida, con mejor luz, o activa el modo de máxima robustez."
+        );
         return;
       }
 
-      setScanResult(result);
+      setScanResult(result.text);
+      setScanEngine(result.engine);
     } catch (error) {
       setIsScanning(false);
       setScanError("Error interno al procesar el QR.");
@@ -335,8 +455,8 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#050507] text-white font-sans selection:bg-indigo-500/30 overflow-hidden relative">
       {/* Background Atmosphere */}
-      <div className="absolute -top-50 -right-50 -w-150 -h-150 bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none"></div>
-      <div className="absolute -bottom-25 -left-25 -w-125 -h-125 bg-blue-500/5 rounded-full blur-[100px] pointer-events-none"></div>
+      <div className="absolute top-50 right-50 w-150 h-150 bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none"></div>
+      <div className="absolute bottom-25 left-25 w-125 h-125 bg-blue-500/5 rounded-full blur-[100px] pointer-events-none"></div>
 
       <div className="max-w-6xl mx-auto p-4 md:p-8 relative z-10">
         {/* Header */}
@@ -573,9 +693,34 @@ export default function App() {
                   {isScanning ? 'Escaneando...' : 'Escanear QR'}
                 </button>
 
+                <label className="flex items-center justify-between gap-3 px-4 py-3 rounded-2xl bg-white/5 border border-white/10 cursor-pointer hover:bg-white/[0.07] transition-colors">
+                  <div>
+                    <p className="text-[11px] font-bold text-gray-200">Modo máxima robustez</p>
+                    <p className="text-[9px] text-gray-500 mt-0.5">Más lento, recupera QR con ángulo, rotación o calidad muy baja</p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={maxRobustness}
+                    onClick={() => setMaxRobustness((v) => !v)}
+                    className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${maxRobustness ? "bg-indigo-600" : "bg-white/10"}`}
+                  >
+                    <span
+                      className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-md transition-transform ${maxRobustness ? "translate-x-5" : "translate-x-0"}`}
+                    />
+                  </button>
+                </label>
+
                 {scanResult && (
                   <div className="p-4 rounded-3xl bg-green-500/10 border border-green-500/20 text-white">
-                    <p className="text-[10px] uppercase tracking-[0.35em] text-green-300 mb-2">Resultado</p>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-[10px] uppercase tracking-[0.35em] text-green-300">Resultado</p>
+                      {scanEngine && (
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-green-400/70 bg-green-500/10 px-2 py-0.5 rounded-full border border-green-500/20">
+                          {scanEngine === "ZXing" ? "Motor robusto" : "Lectura rápida"}
+                        </span>
+                      )}
+                    </div>
                     <p className="text-sm font-mono wrap-break-words">{scanResult}</p>
                   </div>
                 )}
