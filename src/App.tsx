@@ -14,6 +14,7 @@ import QRCodeStyling, {
   CornerSquareType,
   CornerDotType
 } from "qr-code-styling";
+import jsQR from "jsqr";
 import { 
   Download, 
   Link as LinkIcon, 
@@ -24,12 +25,151 @@ import {
   Check, 
   Layout, 
   Image as ImageIcon,
+  Scan,
   Type
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
 // Custom types for our state
 type Extension = "png" | "jpeg" | "webp" | "svg";
+
+/* ------------------------------------------------------------------ */
+/*  QR DECODING ENGINE                                                 */
+/*  ------------------------------------------------------------------ */
+/*  qrcode-reader (the old library) decodes the raw pixel data with   */
+/*  no preprocessing at all, so it fails constantly on real-world     */
+/*  images: phone photos, low contrast, large resolutions, slight     */
+/*  rotation, JPEG noise, non-white backgrounds, etc.                 */
+/*                                                                      */
+/*  This new pipeline, built on jsQR, instead:                        */
+/*   1. Draws the image onto a canvas at several candidate scales     */
+/*      (jsQR — like most QR detectors — works best when the QR      */
+/*      modules are a handful of pixels wide, not thousands).         */
+/*   2. Tries both normal and inverted luminance (light-on-dark QRs). */
+/*   3. Applies contrast stretching so washed-out / low-contrast      */
+/*      photos still binarize cleanly.                                */
+/*   4. Stops at the first successful decode, trying progressively    */
+/*      more aggressive strategies only if needed.                    */
+/* ------------------------------------------------------------------ */
+
+interface DecodeAttempt {
+  label: string;
+  canvas: HTMLCanvasElement;
+  invert: boolean;
+}
+
+/** Loads a data URL into an HTMLImageElement. */
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = (e) => reject(e);
+    img.src = src;
+  });
+}
+
+/** Draws `img` onto a new canvas scaled so its longest side equals `targetSize`. */
+function drawScaled(img: HTMLImageElement, targetSize: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  const longest = Math.max(img.width, img.height);
+  const scale = targetSize / longest;
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  // imageSmoothingEnabled true gives nicer downscaling for big photos;
+  // for upscaling tiny QR crops we actually want it off so edges stay crisp.
+  ctx.imageSmoothingEnabled = scale < 1;
+  ctx.drawImage(img, 0, 0, w, h);
+  return canvas;
+}
+
+/** Stretches contrast (min-max normalization) on grayscale-equivalent luminance, in place. */
+function applyContrastStretch(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+
+  let min = 255;
+  let max = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+    if (lum < min) min = lum;
+    if (lum > max) max = lum;
+  }
+
+  const range = max - min;
+  if (range < 10) return; // already flat / no useful contrast info to stretch
+
+  for (let i = 0; i < data.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const v = data[i + c];
+      data[i + c] = Math.max(0, Math.min(255, ((v - min) / range) * 255));
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+/** Builds the ordered list of decode attempts, cheapest/most-likely first. */
+function buildAttempts(img: HTMLImageElement): DecodeAttempt[] {
+  const attempts: DecodeAttempt[] = [];
+
+  // Candidate target sizes. jsQR scans pixel-by-pixel, so very large
+  // images are slow AND often harder to binarize evenly (uneven photo
+  // lighting). Smaller, evenly-scaled versions are frequently easier
+  // to decode for photographed (vs. clean screenshot) QR codes.
+  const sizes = [800, 1200, 500, 350];
+
+  for (const size of sizes) {
+    const base = drawScaled(img, size);
+    const ctx = base.getContext("2d")!;
+    applyContrastStretch(ctx, base.width, base.height);
+    attempts.push({ label: `scale-${size}`, canvas: base, invert: false });
+  }
+
+  return attempts;
+}
+
+/** Runs jsQR against a canvas, optionally inverting luminance first. */
+function tryDecodeCanvas(canvas: HTMLCanvasElement, invert: boolean) {
+  const ctx = canvas.getContext("2d")!;
+  const { width, height } = canvas;
+  const imageData = ctx.getImageData(0, 0, width, height);
+
+  if (invert) {
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = 255 - data[i];
+      data[i + 1] = 255 - data[i + 1];
+      data[i + 2] = 255 - data[i + 2];
+    }
+  }
+
+  return jsQR(imageData.data, width, height, {
+    inversionAttempts: "attemptBoth",
+  });
+}
+
+/**
+ * Attempts to decode a QR code from a data URL using multiple
+ * scales and luminance strategies. Resolves with the decoded text,
+ * or null if every attempt failed.
+ */
+async function decodeQrFromDataUrl(dataUrl: string): Promise<string | null> {
+  const img = await loadImage(dataUrl);
+  const attempts = buildAttempts(img);
+
+  for (const attempt of attempts) {
+    const result = tryDecodeCanvas(attempt.canvas, attempt.invert);
+    if (result?.data) {
+      return result.data;
+    }
+  }
+
+  return null;
+}
 
 export default function App() {
   const [url, setUrl] = useState("https://google.com");
@@ -39,7 +179,11 @@ export default function App() {
   const [cornersType, setCornersType] = useState<CornerSquareType>("extra-rounded");
   const [cornerDotsType, setCornerDotsType] = useState<CornerDotType>("dot");
   const [logo, setLogo] = useState<string | undefined>(undefined);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [qrPreview, setQrPreview] = useState<string | null>(null);
+  const [scanResult, setScanResult] = useState<string | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+
   const [downloadFormat, setDownloadFormat] = useState<Extension>("png");
   const [resolution, setResolution] = useState(1000);
 
@@ -104,7 +248,7 @@ export default function App() {
           type: cornerDotsType,
           color: dotsColor,
         },
-        image: logo
+        image: logo,
       });
     }
   }, [url, dotsColor, bgColor, dotsType, cornersType, cornerDotsType, logo]);
@@ -118,15 +262,58 @@ export default function App() {
     }
   };
 
+  const handleQrUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    setScanResult(null);
+    setScanError(null);
+    if (!file) {
+      setQrPreview(null);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setQrPreview(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleQrScan = async () => {
+    if (!qrPreview) return;
+
+    setIsScanning(true);
+    setScanResult(null);
+    setScanError(null);
+
+    try {
+      const result = await decodeQrFromDataUrl(qrPreview);
+      setIsScanning(false);
+
+      if (!result) {
+        setScanError("No se pudo leer el código QR. Intenta con una foto más nítida, con mejor luz, o más de cerca.");
+        return;
+      }
+
+      setScanResult(result);
+    } catch (error) {
+      setIsScanning(false);
+      setScanError("Error interno al procesar el QR.");
+      console.error("Error decoding QR code:", error);
+    }
+  };
+
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setLogo(event.target?.result as string);
-      };
-      reader.readAsDataURL(file);
-    }
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setLogo(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
   };
 
   const resetLogo = () => setLogo(undefined);
@@ -148,8 +335,8 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#050507] text-white font-sans selection:bg-indigo-500/30 overflow-hidden relative">
       {/* Background Atmosphere */}
-      <div className="absolute top-[-200px] right-[-200px] w-[600px] h-[600px] bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none"></div>
-      <div className="absolute bottom-[-100px] left-[-100px] w-[500px] h-[500px] bg-blue-500/5 rounded-full blur-[100px] pointer-events-none"></div>
+      <div className="absolute -top-50 -right-50 -w-150 -h-150 bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none"></div>
+      <div className="absolute -bottom-25 -left-25 -w-125 -h-125 bg-blue-500/5 rounded-full blur-[100px] pointer-events-none"></div>
 
       <div className="max-w-6xl mx-auto p-4 md:p-8 relative z-10">
         {/* Header */}
@@ -159,11 +346,11 @@ export default function App() {
           className="mb-12 flex items-center justify-between"
         >
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-blue-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
+            <div className="w-10 h-10 bg-linear-to-br from-indigo-500 to-blue-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20">
               <RefreshCw className="text-white w-6 h-6" />
             </div>
             <div>
-              <h1 className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400 leading-none">
+              <h1 className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-linear-to-r from-white to-gray-400 leading-none">
                 QR STUDIO <span className="text-[10px] bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded ml-1 border border-indigo-500/30 align-middle">PRO</span>
               </h1>
               <p className="text-[10px] text-gray-500 uppercase tracking-widest mt-1">Crea códigos QR profesionales</p>
@@ -171,7 +358,7 @@ export default function App() {
           </div>
           <div className="hidden sm:flex items-center gap-4">
             <div className="px-4 py-2 rounded-full bg-white/5 border border-white/10 text-[11px] font-bold text-gray-400">
-              v4.2.0
+              v4.3.0
             </div>
           </div>
         </motion.header>
@@ -354,11 +541,58 @@ export default function App() {
                 </div>
               </div>
             </motion.section>
+
+            <motion.section variants={itemVariants} className="p-6 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-md shadow-2xl">
+              <div className="flex items-center gap-2 mb-8 text-indigo-400 font-bold uppercase tracking-[0.2em] text-[10px]">
+                <Scan className="w-4 h-4" />
+                <label>QR Scanner</label>
+              </div>
+              <div className="grid gap-4">
+                <label className="flex flex-col items-center justify-center w-full h-44 border-2 border-dashed border-white/10 rounded-2xl cursor-pointer hover:bg-white/5 transition-all group hover:border-indigo-500/50">
+                  <Scan className="w-10 h-10 text-white/20 group-hover:text-indigo-400 mb-2 group-hover:scale-110 transition-transform" />
+                  <span className="text-[11px] text-gray-400 font-bold uppercase tracking-widest">Subir QR para leer</span>
+                  <input type="file" className="hidden" accept="image/*" onChange={handleQrUpload} />
+                </label>
+
+                {qrPreview ? (
+                  <div className="rounded-3xl overflow-hidden border border-white/10 bg-slate-950/30 p-3">
+                    <p className="text-[10px] uppercase tracking-[0.35em] text-gray-500 mb-3">Vista previa</p>
+                    <img src={qrPreview} alt="QR preview" className="w-full max-h-60 object-contain rounded-2xl bg-black/20" />
+                  </div>
+                ) : (
+                  <div className="rounded-3xl border border-dashed border-white/10 bg-black/10 p-4 text-center text-[11px] text-gray-400">
+                    Carga una imagen de QR para previsualizar aquí.
+                  </div>
+                )}
+
+                <button
+                  onClick={handleQrScan}
+                  disabled={!qrPreview || isScanning}
+                  className={`w-full py-3 rounded-2xl font-bold uppercase transition-all ${qrPreview && !isScanning ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20 hover:bg-indigo-500' : 'bg-white/5 text-gray-500 cursor-not-allowed border border-white/10'}`}
+                >
+                  {isScanning ? 'Escaneando...' : 'Escanear QR'}
+                </button>
+
+                {scanResult && (
+                  <div className="p-4 rounded-3xl bg-green-500/10 border border-green-500/20 text-white">
+                    <p className="text-[10px] uppercase tracking-[0.35em] text-green-300 mb-2">Resultado</p>
+                    <p className="text-sm font-mono wrap-break-words">{scanResult}</p>
+                  </div>
+                )}
+
+                {scanError && (
+                  <div className="p-4 rounded-3xl bg-red-500/10 border border-red-500/20 text-red-200">
+                    <p className="text-[10px] uppercase tracking-[0.35em] text-red-300 mb-2">Error</p>
+                    <p className="text-sm">{scanError}</p>
+                  </div>
+                )}
+              </div>
+            </motion.section>
           </div>
 
           {/* Right Panel: Preview & Download */}
           <div className="lg:col-span-5 space-y-6 lg:sticky lg:top-8">
-            <motion.section variants={itemVariants} className="p-8 rounded-[48px] bg-gradient-to-br from-white/10 to-transparent border border-white/20 backdrop-blur-2xl shadow-[0_0_80px_-20px_rgba(99,102,241,0.2)] flex flex-col items-center">
+            <motion.section variants={itemVariants} className="p-8 rounded-[48px] bg-linear-to-br from-white/10 to-transparent border border-white/20 backdrop-blur-2xl shadow-[0_0_80px_-20px_rgba(99,102,241,0.2)] flex flex-col items-center">
               <div className="flex items-center gap-2 mb-8 w-full text-indigo-400 font-bold uppercase tracking-[0.2em] text-[10px] self-start">
                 <Layout className="w-4 h-4" />
                 <h2 className="text-xs">Live Matrix Render</h2>
@@ -399,7 +633,7 @@ export default function App() {
 
                 <button
                   onClick={handleDownload}
-                  className="group w-full bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 hover:to-blue-500 text-white font-bold py-5 rounded-2xl shadow-xl shadow-indigo-600/20 transition-all flex items-center justify-center gap-3 active:scale-[0.98]"
+                  className="group w-full bg-linear-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 hover:to-blue-500 text-white font-bold py-5 rounded-2xl shadow-xl shadow-indigo-600/20 transition-all flex items-center justify-center gap-3 active:scale-[0.98]"
                 >
                   <Download className="w-6 h-6" />
                   <span className="text-lg">DOWNLOAD VECTOR</span>
